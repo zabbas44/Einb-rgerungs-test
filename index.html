@@ -219,7 +219,7 @@ const I = {
 
 /* ---------- state (saved on this device) ---------- */
 const blank = () => ({ v:1, cur:0, stats:{}, answers:{}, sessions:[], exam:null,
-  settings:{ rate:0.9, deVoice:'', urVoice:'', autoReveal:true, autoQuestion:false } });
+  settings:{ rate:0.9, deVoice:'', urVoice:'', autoReveal:true, autoQuestion:false, recorded:true } });
 let S = blank();
 try { const raw = localStorage.getItem(KEY); if (raw) S = Object.assign(blank(), JSON.parse(raw)); S.settings = Object.assign(blank().settings, S.settings||{}); } catch (e) {}
 let saveT;
@@ -261,22 +261,41 @@ function setPlayUI() {
     b.setAttribute('aria-label', on && player.state === 'playing' ? 'Pause' : 'Play');
   });
 }
+const audioEl = new Audio(); audioEl.preload = 'auto';
+let usingFile = false;
 function stopAll() {
   player.queue = []; player.id = null; player.state = 'idle';
+  try { audioEl.pause(); } catch (e) {}
   try { synth && synth.cancel(); } catch (e) {}
   try { claudeTTS && claudeTTS.stop(); } catch (e) {}
   setPlayUI();
 }
-function speakOne(text, lang, id, done) {
+function speakOne(item, done) {
+  const { text, lang, id, src } = item;
   player.id = id; player.state = 'playing'; setPlayUI();
   const finish = () => { if (player.id !== id) return; done && done(); };
+  if (src && S.settings.recorded !== false) {
+    getClip(src).then(url => {
+      if (player.id !== id || player.state !== 'playing') return;
+      if (!url) { usingFile = false; speakSynth(text, lang, id, finish); return; }
+      usingFile = true;
+      audioEl.onended = finish;
+      audioEl.onerror = () => { if (player.id !== id) return; usingFile = false; speakSynth(text, lang, id, finish); };
+      audioEl.src = url; audioEl.playbackRate = S.settings.rate / 0.9;
+      const pr = audioEl.play(); if (pr && pr.catch) pr.catch(() => { if (player.id === id && audioEl.paused) { usingFile = false; speakSynth(text, lang, id, finish); } });
+    });
+    return;
+  }
+  usingFile = false; speakSynth(text, lang, id, finish);
+}
+function speakSynth(text, lang, id, finish) {
   const v = pickVoice(lang);
   if (!v && lang === 'ur' && claudeTTS) {
     claudeTTS.speak(text, { language:'ur', voice:'airy', rate:S.settings.rate }).then(finish).catch(() => { if (player.id === id) { player.state='idle'; setPlayUI(); } });
     return;
   }
-  if (!synth) { toast('Audio is not supported in this browser.'); player.state='idle'; setPlayUI(); return; }
-  if (!v && lang === 'ur') toast('Urdu voice is not installed on this device. Text is shown above.');
+  if (!synth) { toast('Audio wird in diesem Browser nicht unterstützt.'); player.state='idle'; setPlayUI(); return; }
+  if (!v && lang === 'ur') toast('Urdu-Audio ist noch nicht verfügbar. Der Text steht oben.');
   const u = new SpeechSynthesisUtterance(text.replace(/…/g, '...'));
   u.lang = lang === 'de' ? 'de-DE' : 'ur-PK';
   if (v) u.voice = v;
@@ -288,17 +307,18 @@ function speakOne(text, lang, id, done) {
 function runQueue() {
   const item = player.queue.shift();
   if (!item) { player.state = 'idle'; player.id = null; setPlayUI(); return; }
-  speakOne(item.text, item.lang, item.id, runQueue);
+  speakOne(item, runQueue);
 }
 function play(items) { stopAll(); player.queue = items.slice(); runQueue(); }
 function toggle(id, items) {
   if (player.id === id && player.state === 'playing') {
-    try { if (claudeTTS && !pickVoice(items[0].lang) && items[0].lang==='ur') claudeTTS.pause(); else synth.pause(); } catch (e) {}
+    try { if (usingFile) audioEl.pause(); else if (claudeTTS && !pickVoice(items[0].lang) && items[0].lang==='ur') claudeTTS.pause(); else synth.pause(); } catch (e) {}
     player.state = 'paused'; setPlayUI(); return;
   }
   if (player.id === id && player.state === 'paused') {
-    try { if (claudeTTS && !pickVoice(items[0].lang) && items[0].lang==='ur') claudeTTS.resume(); else synth.resume(); } catch (e) {}
     player.state = 'playing'; setPlayUI();
+    if (usingFile) { audioEl.play().catch(() => play(items)); return; }
+    try { if (claudeTTS && !pickVoice(items[0].lang) && items[0].lang==='ur') claudeTTS.resume(); else synth.resume(); } catch (e) {}
     // some mobile browsers ignore resume(); restart if nothing is speaking
     setTimeout(() => { if (player.id === id && player.state === 'playing' && synth && !synth.speaking) play(items); }, 400);
     return;
@@ -306,6 +326,33 @@ function toggle(id, items) {
   const q = cur(); if (q) { st(q.n).plays++; save(); }
   play(items);
 }
+const nnn = n => String(n).padStart(3, '0');
+const clip = (lang, kind, q) => `${lang}/${kind}${nnn(q.n)}`;
+/* Recorded voices live in audio/pNN.json (10 questions per pack, base64 mp3). */
+const packs = {}, clipUrls = {};
+function loadPack(p) {
+  if (p < 1 || p > 30) return Promise.resolve(null);
+  return packs[p] ||= fetch(`audio/p${String(p).padStart(2, '0')}.json`).then(r => r.ok ? r.json() : null).catch(() => null);
+}
+function getClip(key) {
+  if (clipUrls[key]) return Promise.resolve(clipUrls[key]);
+  const n = parseInt(key.slice(4), 10);
+  return loadPack(Math.ceil(n / 10)).then(d => {
+    if (!d || !d[key]) return null;
+    const bin = atob(d[key]), u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    return clipUrls[key] = URL.createObjectURL(new Blob([u8], { type:'audio/mpeg' }));
+  });
+}
+/* iOS only lets a page play sound it started from a tap; unlock the one audio element on the first tap. */
+let unlocked = false;
+const SILENT = 'data:audio/mpeg;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjYwLjE2LjEwMAAAAAAAAAAAAAAA//OEwAAAAAAAAAAAAEluZm8AAAAPAAAACQAABCAARUVFRUVFRUVFRUVdXV1dXV1dXV1dXXR0dHR0dHR0dHR0i4uLi4uLi4uLi4uioqKioqKioqKiorq6urq6urq6urq60dHR0dHR0dHR0dHo6Ojo6Ojo6Ojo6P//////////////AAAAAExhdmM2MC4zMQAAAAAAAAAAAAAAACQD8AAAAAAAAAQgDeb0IwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA//NExAAAAANIAAAAAExBTUUzLjEwMFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMu//NExFMAAANIAAAAADEwMFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMu//NExKYAAANIAAAAADEwMFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMu//NExKwAAANIAAAAADEwMFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMu//NExKwAAANIAAAAADEwMFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMu//NExKwAAANIAAAAADEwMFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVTEFNRTMu//NExKwAAANIAAAAADEwMFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//NExKwAAANIAAAAAFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV//NExKwAAANIAAAAAFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV';
+function unlockAudio() {
+  if (unlocked) return; unlocked = true;
+  try { audioEl.src = SILENT; const pr = audioEl.play(); if (pr && pr.catch) pr.catch(() => { unlocked = false; }); } catch (e) { unlocked = false; }
+}
+document.addEventListener('touchend', unlockAudio, { capture:true });
+document.addEventListener('click', unlockAudio, { capture:true });
 
 /* ---------- helpers ---------- */
 const cur = () => Q[order[pos]];
@@ -410,6 +457,7 @@ function renderQuiz(animate) {
   const q = cur(); if (!q) return;
   const s = st(q.n); s.views++; s.last = Date.now();
   if (mode === 'practice') S.cur = order[pos];
+  if (S.settings.recorded !== false) { loadPack(Math.ceil(q.n / 10)); const nx = Q[order[pos + 1]]; if (nx) loadPack(Math.ceil(nx.n / 10)); }
   save();
   const chosen = mode === 'exam' ? S.exam.answers[q.n] : S.answers[q.n];
   const answeredNow = mode === 'exam' && chosen !== undefined;
@@ -464,9 +512,9 @@ function renderQuiz(animate) {
     </div></nav>
   </section>`;
   window.scrollTo(0, 0);
-  const qItemsDe = [{ text:speakTextDe(q.de), lang:'de', id:'qde' }];
+  const qItemsDe = [{ text:speakTextDe(q.de), lang:'de', id:'qde', src:clip('de','q',q) }];
   $('[data-say="qde"]').onclick = () => toggle('qde', qItemsDe);
-  $('[data-say="qur"]').onclick = () => toggle('qur', [{ text:q.ur, lang:'ur', id:'qur' }]);
+  $('[data-say="qur"]').onclick = () => toggle('qur', [{ text:q.ur, lang:'ur', id:'qur', src:clip('ur','q',q) }]);
   $('#home').onclick = () => { if (mode === 'exam') finishExam(true); else renderWelcome(); };
   $('#jump').onclick = () => { if (mode === 'practice') openSheet('jump'); };
   $('#prev').onclick = () => go(-1);
@@ -525,15 +573,15 @@ function reveal(autoplay) {
           <p class="a-ur urdu" lang="ur">${esc(q.uo[q.c])}</p>
         </div>
       </section>`;
-    $('[data-say="ade"]').onclick = () => toggle('ade', [{ text:speakTextDe(q.o[q.c]), lang:'de', id:'ade' }]);
-    $('[data-say="aur"]').onclick = () => toggle('aur', [{ text:q.uo[q.c], lang:'ur', id:'aur' }]);
+    $('[data-say="ade"]').onclick = () => toggle('ade', [{ text:speakTextDe(q.o[q.c]), lang:'de', id:'ade', src:clip('de','a',q) }]);
+    $('[data-say="aur"]').onclick = () => toggle('aur', [{ text:q.uo[q.c], lang:'ur', id:'aur', src:clip('ur','a',q) }]);
     const r = $('#reveal'); r.classList.add('done'); r.innerHTML = `<span>Nochmal hören</span><span class="urdu">دوبارہ سنیں</span>`;
     if (mode === 'practice' || S.exam.answers[q.n] !== undefined) markOptions(mode === 'exam' ? S.exam.answers[q.n] : S.answers[q.n], false);
     else document.querySelectorAll('.pic').forEach(p => p.classList.toggle('good', +p.dataset.pic === q.c));
     if (mode === 'practice' && S.answers[q.n] === undefined) document.querySelectorAll('.opt').forEach(b => { if (+b.dataset.i === q.c) b.classList.add('good'); });
     setTimeout(() => $('#answer-slot .answer') && $('#answer-slot .answer').scrollIntoView({ behavior:'smooth', block:'nearest' }), 60);
   }
-  if (autoplay) play([{ text:speakTextDe(q.o[q.c]), lang:'de', id:'ade' }, { text:q.uo[q.c], lang:'ur', id:'aur' }]);
+  if (autoplay) play([{ text:speakTextDe(q.o[q.c]), lang:'de', id:'ade', src:clip('de','a',q) }, { text:q.uo[q.c], lang:'ur', id:'aur', src:clip('ur','a',q) }]);
 }
 function go(d) {
   if (mode === 'exam' && pos + d >= EXAM_LEN) { finishExam(false); return; }
@@ -621,7 +669,9 @@ function renderSheet() {
       return `<option value="">Automatisch${auto ? ' (' + esc(auto.name) + ')' : ''}</option>` + list.map(v => `<option value="${esc(v.voiceURI)}" ${v.voiceURI === sel ? 'selected' : ''}>${esc(v.name)} · ${esc(v.lang)}</option>`).join('');
     };
     const hasUr = voices.some(v => (v.lang||'').toLowerCase().startsWith('ur'));
-    body = `<div class="field"><label for="v-de">Deutsche Stimme</label><select id="v-de">${opt('de')}</select></div>
+    body = `<label class="toggle"><span>Aufgenommene Profi-Stimmen verwenden (empfohlen)</span><input type="checkbox" id="t-rec" ${S.settings.recorded !== false ? 'checked' : ''}></label>
+      <p class="note" style="margin:10px 0 14px">Die Gerätestimmen unten werden nur benutzt, wenn eine Aufnahme fehlt oder die Option oben aus ist.</p>
+      <div class="field"><label for="v-de">Deutsche Stimme</label><select id="v-de">${opt('de')}</select></div>
       <div class="field"><label for="v-ur">Urdu-Stimme</label><select id="v-ur">${opt('ur')}</select></div>
       ${hasUr ? '' : `<p class="note">Auf diesem Gerät ist keine Urdu-Stimme installiert${claudeTTS ? '; es wird eine Claude-Stimme verwendet' : ''}. Auf dem iPhone: Einstellungen › Bedienungshilfen › Gesprochene Inhalte › Stimmen. Android und Microsoft Edge bringen Urdu-Stimmen (z. B. „Uzma“) mit.</p>`}
       <div class="field" style="margin-top:14px"><label for="rate">Sprechtempo: <span id="rate-v">${S.settings.rate.toFixed(2)}</span>×</label><input id="rate" type="range" min="0.6" max="1.3" step="0.05" value="${S.settings.rate}"></div>
@@ -653,8 +703,9 @@ function renderSheet() {
     $('#rate').oninput = e => { S.settings.rate = +e.target.value; $('#rate-v').textContent = S.settings.rate.toFixed(2); save(); };
     $('#t-auto').onchange = e => { S.settings.autoReveal = e.target.checked; save(); };
     $('#t-q').onchange = e => { S.settings.autoQuestion = e.target.checked; save(); };
-    $('#test-de').onclick = () => play([{ text:'Willkommen beim Einbürgerungstest. Viel Erfolg!', lang:'de', id:'t' }]);
-    $('#test-ur').onclick = () => play([{ text:'آئن بُرگرُونگس ٹیسٹ میں خوش آمدید۔ کامیابی آپ کے قدم چومے۔', lang:'ur', id:'t' }]);
+    $('#t-rec').onchange = e => { S.settings.recorded = e.target.checked; save(); };
+    $('#test-de').onclick = () => play([{ text:'Willkommen beim Einbürgerungstest. Viel Erfolg!', lang:'de', id:'t', src:Q[0] && clip('de','q',Q[0]) }]);
+    $('#test-ur').onclick = () => play([{ text:'آئن بُرگرُونگس ٹیسٹ میں خوش آمدید۔ کامیابی آپ کے قدم چومے۔', lang:'ur', id:'t', src:Q[0] && clip('ur','q',Q[0]) }]);
   }
 }
 async function exportData() {
